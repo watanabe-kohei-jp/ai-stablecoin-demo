@@ -1,0 +1,29 @@
+# x402 本体（fastapi=売り手, httpx=買い手クライアント, evm=Ethereum系署名）
+# これが eth-account / web3 などの必要バージョンを自動で連れてくる
+x402[fastapi,httpx,evm]==2.12.0
+
+# 売り手サーバーを起動する ASGI サーバー
+uvicorn>=0.34
+
+# 残高確認（USDCのbalanceOfをRPC経由で読む）
+web3>=7.0
+
+# 自動スイープVault（MockYieldVault.sol）のコンパイル/デプロイ
+py-solc-x>=2.0.0
+
+# 設定ファイル(.env)読み込み
+python-dotenv>=1.0
+
+# ターミナルログを見やすく（決済ログ演出）
+rich>=13.9
+
+# --- Phase 5：LLM頭脳（御三家比較）。キーが無い社はスキップされるので必須ではない ---
+# Claude（Anthropic）
+anthropic>=0.40
+# GPT（OpenAI）
+openai>=1.50
+# Gemini（Google）
+google-genai>=1.0
+
+# 統計ベンチの図生成（scripts/plot_bench.py）
+matplotlib>=3.8
