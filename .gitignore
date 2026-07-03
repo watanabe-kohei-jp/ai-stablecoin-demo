@@ -1,0 +1,26 @@
+# --- 秘密情報（絶対にコミットしない） ---
+.env
+*.key
+wallet*.json
+# Kaggle API トークン（手元のみ・絶対にコミット/アップロードしない）
+kaggle.json
+**/kaggle.json
+
+# --- Python ---
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- ログ・一時 ---
+*.log
+.audit/
+
+# --- Solidity ビルド成果物（deploy_vault.py が生成・.sol から再生成可能） ---
+contracts/*.abi.json
