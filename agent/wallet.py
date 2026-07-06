@@ -52,6 +52,8 @@ _UNIT = 10 ** USDC_DECIMALS
 
 # 自動スイープ用：Vault ABI（deploy_vault.py が出力）と、USDC の最小 ERC20 ABI
 _VAULT_ABI_PATH = Path(__file__).resolve().parent.parent / "contracts" / "MockYieldVault.abi.json"
+# 流動性の階段・奥の段：模擬ST（二段階償還）の ABI（deploy_ladder.py が出力）
+_ST_ABI_PATH = Path(__file__).resolve().parent.parent / "contracts" / "MockSecurityToken.abi.json"
 _ERC20_ABI = [
     {"constant": False, "inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}],
      "name": "approve", "outputs": [{"name": "", "type": "bool"}], "type": "function"},
@@ -99,6 +101,8 @@ class Wallet:
         vault_address: str | None = None,
         min_operating_usdc: float = 0.0,
         max_vault_alloc: float = 1.0,
+        st_address: str | None = None,
+        st_alloc: float = 0.5,
     ) -> None:
         self._account = Account.from_key(private_key)   # 鍵はここだけ（非公開）
         self.address = self._account.address            # アドレスは公開情報
@@ -114,10 +118,15 @@ class Wallet:
         self._w3: Web3 | None = None
         self._usdc = None
         self._vault = None
+        self._st = None                                 # 模擬ST（遅延層）。無ければ従来どおり
         self._chain_id = int(network.split(":")[-1])    # "eip155:84532" -> 84532
         self.min_operating_base = usdc_to_base(min_operating_usdc)
         self.max_vault_alloc = max_vault_alloc
+        if not (0.0 <= st_alloc <= 1.0):
+            raise ValueError(f"st_alloc は 0.0〜1.0 の範囲（指定: {st_alloc}）")
+        self.st_alloc = st_alloc                        # sweep時に余剰のうちSTへ回す割合
         self.treasury_audit: list[str] = []
+        self._st_requests: list[dict] = []              # ST償還予約の控え（id/assets/unlock_at/claimed）
         if rpc_url and usdc_address:
             self._w3 = Web3(Web3.HTTPProvider(rpc_url))
             if not self._w3.is_connected():
@@ -138,6 +147,14 @@ class Wallet:
                 vasset = Web3.to_checksum_address(self._vault.functions.asset().call())
                 if vasset != self._usdc_address:
                     raise RuntimeError(f"Vault.asset()がUSDCと不一致: {vasset} != {self._usdc_address}")
+            if st_address:
+                # 流動性の階段・奥の段：模擬ST（高利回り・二段階償還＝即時に出せない）
+                st_abi = json.loads(_ST_ABI_PATH.read_text(encoding="utf-8"))
+                self._st_address = Web3.to_checksum_address(st_address)
+                self._st = self._w3.eth.contract(address=self._st_address, abi=st_abi)
+                sasset = Web3.to_checksum_address(self._st.functions.asset().call())
+                if sasset != self._usdc_address:
+                    raise RuntimeError(f"ST.asset()がUSDCと不一致: {sasset} != {self._usdc_address}")
 
         # x402 クライアント（署名前フックで予算を強制）
         self._signer = EthAccountSigner(self._account)
@@ -224,13 +241,14 @@ class Wallet:
                 # JIT: 流動性不足で中止された → 不足分を Vault から償還して再実行（価格表に非依存）
                 if self._need_redeem_base and self.vault_enabled and not jit_done:
                     need_amount = self._need_amount_base
-                    self._need_redeem_base = 0
                     pos = self.vault_position_base()
                     # 流動性の「読み」は公開RPCで遅延しうるので、不足分(=必要額−流動性)では
                     # なく「支払い額そのもの」を丸ごと償還する。これにより stale read による
                     # 過少償還を防ぎ、手元の運転資金(min_operating)も自然に温存される。
                     redeem_amt = min(need_amount, pos)
                     if redeem_amt > 0:
+                        # フラグはJIT実行が確定してから消す（pos==0 のときは見送り分岐へ・Codex#4）
+                        self._need_redeem_base = 0
                         self.treasury_audit.append(
                             f"JIT償還: 支払い額 ${base_to_usdc(need_amount):.4f} 分を Vault から引き出し"
                         )
@@ -238,6 +256,18 @@ class Wallet:
                         self._wait_liquid(need_amount)   # 反映待ち（RPC遅延対策）
                         jit_done = True
                         continue
+                # 流動性不足だが JIT で調達できない（即時層が空・JIT済みでも不足）
+                # ＝ 資金は ST（遅延層）にあっても償還ラグ中は間に合わない。
+                # これが「流動性ミスマッチ」。意図的拒否として明示的に中止する（資金未移動）。
+                if self._need_redeem_base:
+                    self._need_redeem_base = 0
+                    self.treasury_audit.append("流動性不足: 即時層で調達不能（ST は償還ラグ中）→ 支払い見送り")
+                    r = PurchaseResult(
+                        path=path, ok=False,
+                        reason="流動性不足で見送り: 即時層(預金Vault)に資金がなく、STは償還ラグ中のため即時調達できない",
+                    )
+                    self.audit.append(r)
+                    return r
                 # フックが予算で中止した場合は PaymentError に内包されて飛んでくる（意図的拒否・再試行しない）。
                 if self._last_abort_reason:
                     r = PurchaseResult(path=path, ok=False, reason=f"予算で拒否: {self._last_abort_reason}")
@@ -333,11 +363,13 @@ class Wallet:
         self.treasury_audit.append(f"{label}: tx={txh.hex()}")
         return receipt
 
-    def _wait_allowance(self, min_amount: int, tries: int = 12, wait: float = 2.0) -> None:
+    def _wait_allowance(self, min_amount: int, spender: str | None = None,
+                        tries: int = 12, wait: float = 2.0) -> None:
         """approve 反映を待つ。公開RPCは read-after-write 遅延があるため、
         allowance が min_amount 以上に見えるまでポーリングしてから次の tx を出す。"""
+        spender = spender or self._vault_address
         for _ in range(tries):
-            a = int(self._usdc.functions.allowance(self._account.address, self._vault_address).call())
+            a = int(self._usdc.functions.allowance(self._account.address, spender).call())
             if a >= min_amount:
                 return
             time.sleep(wait)
@@ -362,6 +394,15 @@ class Wallet:
     def _withdraw_from_vault_locked(self, assets_base: int) -> None:
         self._send_tx(self._vault.functions.withdraw(assets_base), f"withdraw ${base_to_usdc(assets_base):.4f}")
 
+    def _deposit_to_st_locked(self, assets_base: int) -> None:
+        # ST への預け入れ。approve の相手（spender）が Vault と違う点に注意。
+        allowance = int(self._usdc.functions.allowance(self._account.address, self._st_address).call())
+        if allowance < assets_base:
+            self._send_tx(self._usdc.functions.approve(self._st_address, assets_base), "approve(ST)")
+            self._wait_allowance(assets_base, spender=self._st_address)
+        self._send_tx(self._st.functions.deposit(assets_base),
+                      f"ST deposit ${base_to_usdc(assets_base):.4f}")
+
     # --- 公開API（ロックを取得して実行） ---
     async def deposit_to_vault(self, assets_usdc: float) -> None:
         async with self._lock:
@@ -377,7 +418,9 @@ class Wallet:
             self._send_tx(self._vault.functions.poke(), "poke")
 
     async def sweep_idle(self) -> int:
-        """運転資金(min_operating)を残し、余剰USDCをVaultへ預ける。預けた最小単位を返す。"""
+        """運転資金(min_operating)を残し、余剰USDCを置き場へ預ける。預けた最小単位を返す。
+        ST（遅延層）が有効なら、余剰のうち st_alloc の割合を ST（高利回り・償還ラグあり）へ、
+        残りを預金Vault（低利回り・即時償還）へ配分する＝流動性の階段。"""
         if not self.vault_enabled:
             return 0
         async with self._lock:
@@ -389,8 +432,20 @@ class Wallet:
                     f"${base_to_usdc(self.min_operating_base):.4f}）"
                 )
                 return 0
-            self._deposit_to_vault_locked(surplus)
-            self.treasury_audit.append(f"sweep: ${base_to_usdc(surplus):.4f} を Vault へ")
+            if self.st_enabled and self.st_alloc > 0:
+                # 動的に代入されても運転資金を侵食しないよう 0〜1 にクランプ（Codex#5）
+                alloc = min(max(self.st_alloc, 0.0), 1.0)
+                st_part = int(surplus * alloc)
+                dep_part = surplus - st_part
+                if st_part > 0:
+                    self._deposit_to_st_locked(st_part)
+                    self.treasury_audit.append(f"sweep: ${base_to_usdc(st_part):.4f} を ST（遅延層）へ")
+                if dep_part > 0:
+                    self._deposit_to_vault_locked(dep_part)
+                    self.treasury_audit.append(f"sweep: ${base_to_usdc(dep_part):.4f} を 預金Vault（即時層）へ")
+            else:
+                self._deposit_to_vault_locked(surplus)
+                self.treasury_audit.append(f"sweep: ${base_to_usdc(surplus):.4f} を Vault へ")
             return surplus
 
     def vault_position_base(self) -> int:
@@ -404,6 +459,99 @@ class Wallet:
 
     def vault_position_usdc(self) -> float:
         return base_to_usdc(self.vault_position_base())
+
+    # ====================== ST（遅延層）＝流動性の階段の奥 ======================
+    # 高利回りだが「即時に出せない」：requestWithdraw → 償還ラグ → claimRedeem。
+    # JIT はこの層からは行わない（間に合わないため）。前もっての償還予約
+    # （plan_liquidity）だけが、この層から資金を取り出す唯一の道。
+
+    @property
+    def st_enabled(self) -> bool:
+        return self._st is not None
+
+    def st_position_base(self) -> int:
+        """ST内の持分を現在価値（USDC最小単位）で返す。"""
+        if not self.st_enabled:
+            return 0
+        sh = int(self._st.functions.shares(self._account.address).call())
+        if sh == 0:
+            return 0
+        return int(self._st.functions.convertToAssets(sh).call())
+
+    def st_position_usdc(self) -> float:
+        return base_to_usdc(self.st_position_base())
+
+    async def plan_liquidity(self, assets_usdc: float) -> dict:
+        """【流動性計画】ST の償還を前もって予約する（受け取りは償還ラグ後）。
+        戻り値: {"id": requestId, "assets": 最小単位, "unlock_at": UNIX秒}"""
+        if not self.st_enabled:
+            raise RuntimeError("ST が未設定")
+        from web3.logs import DISCARD
+        assets_base = usdc_to_base(assets_usdc)
+        async with self._lock:
+            receipt = self._send_tx(self._st.functions.requestWithdraw(assets_base),
+                                    f"ST requestWithdraw ${assets_usdc:.4f}")
+            # requestId は自分の tx の RedeemRequested イベントから取得する。
+            # （requestCount の増分推定は他アドレスの予約と競合しうる・Codex#3）
+            evts = self._st.events.RedeemRequested().process_receipt(receipt, errors=DISCARD)
+            mine = [e for e in evts if e["args"]["who"] == self._account.address]
+            if not mine:
+                raise RuntimeError("償還予約イベントが receipt から取れませんでした")
+            args = mine[0]["args"]
+            req = {"id": int(args["requestId"]), "assets": int(args["assets"]),
+                   "unlock_at": int(args["unlockAt"]), "claimed": False}
+            self._st_requests.append(req)
+            self.treasury_audit.append(
+                f"流動性計画: ST償還を予約 ${base_to_usdc(req['assets']):.4f}"
+                f"（受取可能: +ラグ後 / id={req['id']}）"
+            )
+            return req
+
+    async def claim_st(self, request_id: int, wait_until_unlock: bool = True,
+                       timeout_sec: float = 300.0) -> int:
+        """予約済みのST償還を受け取る。ラグ未経過なら unlock までチェーン時刻で待つ。
+        実txは1回だけ送り、失敗時に自動再送しない（「状態不明なら再送しない」原則・Codex#2）。
+        受け取った最小単位を返す。"""
+        if not self.st_enabled:
+            raise RuntimeError("ST が未設定")
+        # 公開RPCの read-after-write 遅延：予約直後は配列がまだ見えないノードに当たり
+        # 配列外参照で revert しうる。読み取りは状態を変えないので安全に再試行する。
+        req_onchain = None
+        for _ in range(12):
+            try:
+                req_onchain = self._st.functions.requests(request_id).call()
+                break
+            except Exception:
+                time.sleep(2.0)
+        if req_onchain is None:
+            raise RuntimeError(f"ST予約 id={request_id} の読み取りタイムアウト（RPC遅延の可能性）")
+        who, assets, unlock_at, claimed = req_onchain
+        if Web3.to_checksum_address(who) != self._account.address:
+            raise RuntimeError(f"予約 id={request_id} は他アドレスのもの")
+        if claimed:
+            raise RuntimeError(f"予約 id={request_id} は受取済み")
+        deadline = time.time() + timeout_sec
+        # ロック解除待ちは「チェーン時刻」で判定する（実時間はチェーンとズレうる）
+        while wait_until_unlock:
+            blk_ts = int(self._w3.eth.get_block("latest")["timestamp"])
+            if blk_ts >= unlock_at:
+                break
+            if time.time() >= deadline:
+                raise RuntimeError(f"ST claim: ロック解除前にタイムアウト（unlock_at={unlock_at}）")
+            time.sleep(3.0)
+        async with self._lock:
+            # 送信前に1度だけシミュレーション。revert する状態なら実txを出さない
+            self._st.functions.claimRedeem(request_id).call({"from": self._account.address})
+            # 実txは1回だけ（失敗・タイムアウトしても再送しない）
+            self._send_tx(self._st.functions.claimRedeem(request_id),
+                          f"ST claimRedeem id={request_id}")
+            for req in self._st_requests:
+                if req["id"] == request_id:
+                    req["claimed"] = True
+            self.treasury_audit.append(
+                f"ST償還を受取: ${base_to_usdc(int(assets)):.4f}（id={request_id}）"
+            )
+            return int(assets)
 
 
 # ---------------------------------------------------------------------------
