@@ -24,3 +24,9 @@ Thumbs.db
 
 # --- Solidity ビルド成果物（deploy_vault.py が生成・.sol から再生成可能） ---
 contracts/*.abi.json
+
+# --- ベンチの生データ（ladder_brain_bench.py が生成） ---
+scripts/ladder_brain_bench_results.json
+
+# --- 個人的な検討メモ（コミットしない） ---
+docs/idea-map.md
